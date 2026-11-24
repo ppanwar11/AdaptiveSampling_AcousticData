@@ -1,0 +1,626 @@
+---
+title: "Bird detection simulator v2: landscape, world and example species"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: hide
+params:
+  sim_dir: "."                                      # folder with the simv2_00 ... simv2_07 .R files
+  covariate_file: "../outputs/grid_200m_all.csv"    # raw grid file (see simv2_00_config.R)
+  world_seed: 1                                     # seed for the whole simulated world
+  species_forest: null                              # e.g. "sp02"; null = common species with the strongest forest effect
+  species_edge: null                                # e.g. "sp07"; null = species with the most edge-loving betas
+  species_confusable: null                          # e.g. "sp12"; null = confusable species with the highest false positive rate
+  cost_surface_png: "/Users/popanwar/JYU/Projects/Adaptive_Sampling/outputs/grid_cost_surface_v2.png"
+  cell_seed: 10                                     # seed for choosing the example cells
+  one_cell: null                                    # section 5 "One recording": e.g. "120,130" (row,col); null = occupied cell of example 1
+  one_doy: 140                                      # day of year of that recording
+  example_cell: null                                # e.g. "120,130": occupied cell shown for the three examples (must be occupied by the species); null = a species-rich occupied cell
+  demo_cells: null                                  # "Several recordings": e.g. "120,130;80,200;60,60"; null = one cell per day from species-poor to species-rich
+  demo_doy: "130,150,180"                           # one day per demo cell
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.width = 10, fig.height = 4, message = FALSE)
+```
+
+This document shows (1) the standardised landscape, (2) how the simulated world is
+created, (3) three example species in detail and (4) a demo of the simulator, (5) Comparison of beta prameters 
+estimated using HMSC model fitted to simulated data.
+
+# 1. Setup
+
+50x50 km grid around Jyväskylä with cell size of 200x200 m. Total number of cells = 62,500.
+
+```{r load}
+for (f in sort(list.files(params$sim_dir, pattern = "^simv2_0[0-2].*\\.R$", full.names = TRUE))) source(f)
+
+if (!file.exists(params$covariate_file))
+  stop("Cannot find the grid CSV '", params$covariate_file, "'.\n",
+       "While knitting, R looks relative to the Rmd's folder: ", getwd(), "\n",
+       "Use a full path in the header (covariate_file).")
+
+cfg   <- sim_config(seed = params$world_seed, covariate_file = params$covariate_file)
+world <- sim_init(cfg)
+sp    <- world$species          # the species table (truth)
+ok    <- !world$land$water      # TRUE = land cell that can be sampled
+cat("Grid:", cfg$nrow, "x", cfg$ncol, "cells; sampled (non-water) cells:", sum(ok), "\n")
+```
+
+# 2. The standardised landscape
+
+All the covariate and cost_surface information for each cell can be found in "grid_200m_all_z.csv"\
+
+Forest cover in the cell, edge density and forest cover in the 1 km buffer are z-scored
+over the non-water cells (mean 0, SD 1). Grey cells are water: they are excluded and never
+sampled. North is up, west is left. Values are clipped at +/-3 for the colours.
+
+```{r colourbar-helper}
+# Colour bar drawn in its own narrow panel next to a map
+colour_bar <- function(zlim, col, at = NULL, labels = TRUE) {
+  par(mar = c(4, 0.3, 3, 2.5))
+  z <- seq(zlim[1], zlim[2], length.out = length(col))
+  image(x = 0:1, y = z, z = matrix(z, nrow = 1), col = col, axes = FALSE, xlab = "", ylab = "")
+  axis(4, at = at, labels = labels, las = 1)
+  box()
+}
+```
+
+```{r landscape-maps, fig.height=7.5}
+pal  <- hcl.colors(50, "Blue-Red 3")
+zlim <- c(-3, 3)
+water_ov <- ifelse(world$land$water, 1, NA)
+
+layout(matrix(c(1, 2, 3, 4,
+                5, 6, 7, 0), nrow = 2, byrow = TRUE), widths = c(10, 2, 10, 2))
+for (nm in cfg$cov_names) {
+  par(mar = c(4, 4, 3, 1))
+  m <- pmin(pmax(world$land$x[, , nm], -3), 3)
+  m[!ok] <- NA
+  sim_image(m, main = paste(nm, "(z-score)"), col = pal, zlim = zlim)
+  image(seq_len(ncol(m)), seq_len(nrow(m)), t(water_ov), col = "grey70", add = TRUE)
+  colour_bar(zlim, pal)
+}
+par(mar = c(4, 4, 3, 1))
+sim_image(matrix(as.integer(world$land$water), nrow(ok)), main = "Water cells (excluded)",
+          col = c("white", "grey70"))
+legend("topright", fill = c("white", "grey70"), legend = c("land (sampled)", "water (excluded)"),
+       bg = "white", cex = 0.8)
+layout(1)
+```
+
+```{r landscape-hist}
+par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+for (nm in cfg$cov_names)
+  hist(world$land$x[, , nm][ok], breaks = 40, main = nm, xlab = "z-score",
+       col = "grey80", border = "white")
+```
+
+The covariates are skewed and correlated, which makes their effects partly confounded:
+
+```{r landscape-cor}
+knitr::kable(round(cor(world$land$X[as.vector(ok), ]), 2), caption = "Correlation between covariates")
+```
+
+## Grid cost surface
+
+Figure from the grid pipeline (`grid_cost_surface_v2.png`), shown for context.
+
+```{r cost-surface}
+if (file.exists(params$cost_surface_png)) {
+  knitr::include_graphics(params$cost_surface_png)
+} else {
+  cat("Image not found:", params$cost_surface_png, "\nSet cost_surface_png in the header.\n")
+}
+```
+
+# 3. How the world is created
+
+## 3.1. The community: strategy, prevalence profile and confusable species
+
+Every species can also appear as a visitor in cells it does not occupy (`p_visit`).
+
+### 3.1a. Phenology by strategy
+Each curve is one species' acoustic activity (0 outside its onset and cessation, 1 at the
+peak), coloured by strategy. Visitor-only species (if any) are dashed. Dotted lines mark the
+detection season.
+
+```{r phenology-all}
+doys   <- 60:260
+curves <- sim_activity_curves(sp, doys)
+strats  <- c("resident", "short", "long")
+labels  <- c(resident = "Resident", short = "Short-distance migrant", long = "Long-distance migrant")
+col_occ <- c(resident = "#1b9e77", short = "#d95f02", long = "#7570b3")
+
+par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+plot(NA, xlim = range(doys), ylim = c(0, 1), xlab = "day of year",
+     ylab = "activity (relative)", main = "Activity curves by migration strategy")
+for (k in seq_len(nrow(sp))) {
+  vo <- sp$visitor_only[k]
+  lines(doys, curves[k, ], col = adjustcolor(col_occ[sp$strategy[k]], alpha.f = 0.35),
+        lty = if (vo) 2 else 1, lwd = if (vo) 2.5 else 1.5)
+}
+abline(v = c(cfg$doy_min, cfg$doy_max), lty = 3, col = "grey40")
+has_vo <- any(sp$visitor_only)
+legend("topright", bty = "n", cex = 0.85,
+       legend = c(labels[strats], if (has_vo) "visitor-only (dashed)"),
+       col = c(col_occ[strats], if (has_vo) "grey30"),
+       lty = c(1, 1, 1, if (has_vo) 2), lwd = 2)
+```
+
+### 3.1b. Prevalence of the species
+
+Prevalence is the share of land cells a species occupies. Each species gets a target drawn
+from a Beta distribution (red curve); the histogram shows the realised prevalence of the
+occupying species. Dotted lines are the profile limits (rare / intermediate / common).
+
+```{r prevalence}
+prev     <- apply(world$z, 3, function(m) mean(m[ok]))
+prev_occ <- prev[!sp$visitor_only]
+a_b      <- cfg$occupancy$prev_shape
+h <- hist(prev_occ, breaks = seq(0, 1, by = 0.1), plot = FALSE)
+par(mfrow = c(1, 1), mar = c(4, 4, 3, 1))
+hist(prev_occ, breaks = seq(0, 1, by = 0.1), freq = FALSE, col = "grey85", border = "white",
+     ylim = c(0, max(h$density, dbeta(seq(0.01, 0.99, length.out = 99), a_b[1], a_b[2])) * 1.1),
+     xlab = "share of land cells occupied", main = paste("Prevalence of the", length(prev_occ), "occupying species"))
+curve(dbeta(x, a_b[1], a_b[2]), add = TRUE, lwd = 2, col = "red")
+abline(v = cfg$occupancy$profile_breaks, lty = 3, lwd = 2)
+abline(v = mean(prev_occ), lty = 2)
+rug(prev_occ)
+cat("Mean prevalence:", round(mean(prev_occ), 2), "| range:", round(min(prev_occ), 2), "to",
+    round(max(prev_occ), 2), "| species above 0.8:", sum(prev_occ > 0.8), "\n")
+```
+
+```{r community1}
+knitr::kable(table(strategy = sp$strategy, profile = sp$profile),
+             caption = "Number of species by strategy and profile")
+```
+### 3.1c. Classification Performance
+We assume our classifiers are already calibrated. Classifier scores correspond to correct classification probability.\
+\
+For occupied cells: Detections are combination of true detections and false-positives.\
+For unoccupied cells: Detections are combination of false positives or true detections from a visiting individual from landscape. \
+Classifier Score distributions\
+* **true detection** ~ Uniform(0.8, 1)\
+* **false positive** ~ Uniform(0.3, 1.0)\
+* **visitor true detection** ~ Uniform(0.6, 1.0)\
+```{r community2}
+knitr::kable(table(profile = sp$profile, confusable = sp$confusable),
+             caption = "Number of species by profile and confusable flag")
+```
+
+### 3.1d. Some species are notaffected by forest fragmentation
+Each species is drawn as not affected by forest fragmentation with probability `r cfg$occupancy$p_unaffected` (Bernoulli trial).
+Unaffected species have all three betas equal to 0 and act as negative controls for the landscape effects.
+```{r community3}
+knitr::kable(table(profile = sp$profile, frag_affected = sp$frag_affected, useNA = "ifany"),
+             caption = "Number of species by profile and affected by forest fragmentation")
+```
+
+## 3.2. Spatial field e-folding distance
+Each occupying species has one e-folding distance (`field_scale_m`, correlation
+exp(-d / scale), practical range about 3 x scale), drawn independently from the set {NA, 300, 1000, 3000, 10000} in
+`cfg$occupancy$field_scale_m`; NA means no spatial field. 
+
+```{r field-scales, fig.width=11, fig.height=4.5}
+scales <- sort(unique(sp$field_scale_m[!is.na(sp$field_scale_m)]))
+if (length(scales) == 0) {
+  cat("No species has a spatial field in this world.\n")
+} else {
+  n_sc   <- sapply(scales, function(s) sum(sp$field_scale_m == s, na.rm = TRUE))
+  n_none <- sum(is.na(sp$field_scale_m) & !sp$visitor_only)
+  cols   <- hcl.colors(max(length(scales), 3), "Dark 3")[seq_along(scales)]
+  labs   <- paste0(ifelse(scales < 1000, paste0(scales, " m"), paste0(scales / 1000, " km")),
+                   " (", n_sc, " species)")
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  for (xmax in c(30, 3)) {
+    d_km <- seq(0, xmax, length.out = 400)
+    plot(NA, xlim = c(0, xmax), ylim = c(0, 1), xlab = "distance between two cells (km)",
+         ylab = "correlation of the spatial field",
+         main = if (xmax == 30) "Spatial field correlation" else "Zoom: first 3 km")
+    abline(h = 0.05, lty = 3, col = "grey50")
+    if (xmax == 3) abline(v = cfg$cell_m / 1000, lty = 3, col = "grey50")
+    for (k in seq_along(scales)) lines(d_km, exp(-d_km * 1000 / scales[k]), col = cols[k], lwd = 2)
+    if (xmax == 30)
+      legend("topright", bty = "n", lwd = 2, col = cols, legend = labs, cex = 0.9,
+             title = paste0("e-folding distance (", n_none, " species with no field)"))
+  }
+}
+```
+
+## 3.3. Acoustic sampling scheme
+
+BirdPipes records for `r cfg$snippets$length_min` minute every `r cfg$snippets$interval_min` minutes for 24 hours,
+which gives `r sim_n_snippets(cfg)` recordings per day. The schedule can be changed with
+`snippets = list(interval_min = 10, length_min = 1)` in `simv2_00_config.R`.\
+Calling rates are flat over the day (no diel pattern yet)\
+Two species traits control how often a species is detected in these recordings:
+
+* **`lambda`**: the expected number of true calls per 24 h at full activity, in a cell the species occupies.
+  It is drawn per species (log-uniform) from `profile$<class>$lambda` in the config.
+* **`p_visit`**: the daily probability that a species visits a cell it does not occupy (multiplied by
+  the activity curve).
+While visiting, the species calls at
+  `lambda` x activity x `visit_frac` calls per day (`visit_frac` = `r cfg$visitor$visit_frac`), so a visit
+  is usually caught by only a few recordings, if any. Visitors only occur where `z = 0`.
+```{r sampling-scheme, fig.width=10, fig.height=3.6}
+starts <- sim_snippet_starts(cfg)            # start minute of every recording
+len    <- cfg$snippets$length_min
+S      <- length(starts)
+zoom   <- max(60, 3 * cfg$snippets$interval_min)   # minutes shown in the lower panel
+
+par(mfrow = c(2, 1), mar = c(3.5, 1, 3, 1))
+
+# whole day: one tick per recording
+plot(NA, xlim = c(0, 24), ylim = c(0, 1), xaxt = "n", yaxt = "n", xlab = "", ylab = "",
+     main = paste0(S, " recordings of ", len, " min, one every ", cfg$snippets$interval_min,
+                   " min (", round(100 * S * len / 1440, 1), "% of the day recorded)"))
+axis(1, at = seq(0, 24, 3), labels = sprintf("%02d:00", seq(0, 24, 3)))
+segments((starts + len / 2) / 60, 0.15, (starts + len / 2) / 60, 0.85, col = "steelblue", lwd = 1.5)
+box()
+
+# zoom: the actual recordings
+plot(NA, xlim = c(0, zoom), ylim = c(0, 1), xaxt = "n", yaxt = "n", xlab = "", ylab = "",
+     main = paste0("First ", zoom, " minutes of the day"))
+axis(1, at = seq(0, zoom, 10), labels = sprintf("00:%02d", seq(0, zoom, 10) %% 60))
+inz <- starts < zoom
+rect(starts[inz], 0.15, starts[inz] + len, 0.85, col = "steelblue", border = "white")
+mtext("time of day (hh:mm)", side = 1, line = 2.3, cex = 0.8)
+box()
+```
+
+# 4. Three example species
+All species-specific information can be found in "simulated_species.csv"
+```{r pick-examples}
+occ_sp <- sp[!sp$visitor_only, ]
+
+id_forest <- params$species_forest
+if (is.null(id_forest)) {
+  cand <- occ_sp[occ_sp$profile == "common", ]
+  id_forest <- cand$species_id[which.max(cand$beta_forest)]
+}
+id_edge <- params$species_edge
+if (is.null(id_edge)) {
+  cand <- occ_sp[!occ_sp$species_id %in% id_forest, ]
+  id_edge <- cand$species_id[which.max(cand$beta_edge - cand$beta_forest)]
+}
+id_conf <- params$species_confusable
+if (is.null(id_conf)) {
+  cand <- occ_sp[occ_sp$confusable & !occ_sp$species_id %in% c(id_forest, id_edge), ]
+  if (nrow(cand) == 0) stop("No confusable species left to pick in this world")
+  id_conf <- cand$species_id[which.max(cand$p_fp)]
+}
+ex_ids <- c(id_forest, id_edge, id_conf)
+knitr::kable(sp[match(ex_ids, sp$species_id),
+                c("species_id", "strategy", "profile", "confusable", "beta_forest", "beta_edge", "beta_buffer",
+                  "lambda", "p_fp", "prevalence_target")],
+             digits = 3, caption = "The three example species")
+```
+
+* **Example 1**: the common species with the largest forest effect (a forest species).
+* **Example 2**: the species with the most edge-leaning betas (largest `beta_edge - beta_forest`).
+  The betas are random, so check the table: the most edge-leaning species of a world may still
+  have only a weak edge effect.
+* **Example 3**: the confusable species with the highest false positive probability (any profile).
+
+Note: Set `species_forest`, `species_edge` or `species_confusable` in the header to look at any
+other species.
+
+```{r report-function}
+# Draws every figure for one species. Run with results = "asis" (text and tables are printed).
+species_report <- function(sp_id, label) {
+  s  <- match(sp_id, sp$species_id)
+  me <- sp[s, ]
+  set.seed(params$cell_seed + s)
+
+  cat("\n\n## ", label, ": ", sp_id, "\n\n", sep = "")
+
+  # ---- properties ----
+  cat("### Properties\n\n")
+  vals <- sapply(me[1, ], function(v) if (is.numeric(v)) format(signif(v, 3)) else as.character(v))
+  print(knitr::kable(data.frame(parameter = names(vals), value = unname(vals))))
+  cat("\n\n")
+
+  # ---- beta parameters ----
+  cat("### Beta parameters\n\n")
+  cat("Top row: the distribution of each beta among the species affected by fragmentation",
+      "(dashed = community mean, red = this species; unaffected species have betas of exactly 0).",
+      "Bottom row: occupancy probability of this species against each covariate",
+      "(other covariates at their mean, no spatial field).\n\n")
+  occ_all <- sp[!sp$visitor_only & sp$frag_affected %in% TRUE, ]
+  par(mfrow = c(2, 3), mar = c(4, 4, 3, 1))
+  for (nm in cfg$cov_names) {
+    b <- occ_all[[paste0("beta_", nm)]]
+    hist(b, breaks = 12, main = paste("beta", nm), xlab = "effect on logit(psi) per 1 SD",
+         col = "grey85", border = "white")
+    abline(v = cfg$occupancy$beta_mean[[nm]], lty = 2)
+    abline(v = me[[paste0("beta_", nm)]], col = "red", lwd = 2)
+  }
+  xs <- seq(-2.5, 2.5, length.out = 100)
+  for (nm in cfg$cov_names) {
+    plot(xs, plogis(me$beta0 + me[[paste0("beta_", nm)]] * xs), type = "l", lwd = 2, ylim = c(0, 1),
+         xlab = paste(nm, "(z-score)"), ylab = "occupancy probability", main = nm)
+    abline(h = me$prevalence_target, lty = 3, col = "grey50")
+  }
+
+  # ---- occupancy maps ----
+    cat("\n\n### Occupancy: psi, z and spatial field\n\n")
+  cat("Each map has a colour bar. For z, 0 = not occupied and 1 = occupied.\n\n")
+  m <- sim_truth_maps(world, sp_id)
+  if (!is.null(m$field)) m$field[!ok] <- NA
+  layout(matrix(1:6, nrow = 1), widths = c(10, 2.5, 10, 2.5, 10, 2.5))
+  pal_psi <- hcl.colors(50, "YlGnBu", rev = TRUE)
+  par(mar = c(4, 4, 3, 1))
+  sim_image(m$psi, main = "psi (probability of occupancy)", col = pal_psi, zlim = c(0, 1))
+  colour_bar(c(0, 1), pal_psi)
+  par(mar = c(4, 4, 3, 1))
+  sim_image(m$z, main = "z (one random realisation)", col = c("grey90", "darkgreen"), zlim = c(0, 1))
+  colour_bar(c(0, 1), rep(c("grey90", "darkgreen"), each = 25), at = c(0.25, 0.75), labels = c("0", "1"))
+  par(mar = c(4, 4, 3, 1))
+  if (is.null(m$field)) {
+    plot.new(); text(0.5, 0.5, "No spatial field\nfor this species")
+    plot.new()
+  } else {
+    zf <- c(-1, 1) * max(abs(m$field), na.rm = TRUE)
+    pal_f <- hcl.colors(50, "Blue-Red 3")
+    sim_image(m$field, main = "spatial field (logit scale)", col = pal_f, zlim = zf)
+    colour_bar(zf, pal_f)
+  }
+  layout(1)
+  cat("\n\nTarget prevalence: ", round(me$prevalence_target, 3),
+      " | realised: ", round(mean(m$z, na.rm = TRUE), 3),
+      " | field e-folding distance (m): ",
+      if (is.na(me$field_scale_m)) "none" else round(me$field_scale_m),
+      if (!is.na(me$field_scale_m)) paste0(" | field SD: ", cfg$occupancy$field_sd), "\n\n", sep = "")
+
+  # ---- phenology ----
+  cat("### Phenology\n\n")
+  cat("Left: this species (red) against all species. Right: the same curve in 25 occupied cells,",
+      "each shifted by its own random number of days.\n\n")
+  occ <- which(world$z[, , s] == 1, arr.ind = TRUE)
+  stopifnot(nrow(occ) > 0)
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  plot(NA, xlim = range(doys), ylim = c(0, 1), xlab = "day of year", ylab = "activity",
+       main = paste(sp_id, "vs all species"))
+  for (k in seq_len(nrow(sp))) lines(doys, curves[k, ], col = "grey85")
+  lines(doys, curves[s, ], col = "red", lwd = 3)
+  points(c(me$onset, me$peak, me$cessation), c(0, 1, 0), pch = 19)
+  abline(v = c(cfg$doy_min, cfg$doy_max), lty = 2)
+  show <- occ[sample(nrow(occ), min(25, nrow(occ))), , drop = FALSE]
+  plot(NA, xlim = range(doys), ylim = c(0, 1), xlab = "day of year", ylab = "activity",
+       main = "Cell-to-cell timing (25 occupied cells)")
+  for (r in seq_len(nrow(show))) {
+    delta <- sim_with_seed(sim_seed(cfg$seed, 13L, show[r, "row"], show[r, "col"]),
+                           rnorm(nrow(sp), 0, cfg$pheno$cell_shift_sd))[s]
+    lines(doys, sim_activity(doys - delta, me$onset, me$peak, me$cessation, me$shape_kappa),
+          col = adjustcolor("red", 0.35))
+  }
+  abline(v = c(cfg$doy_min, cfg$doy_max), lty = 2)
+
+  # ---- calling features ----
+  cat("\n\n### Calling features\n\n")
+  S <- sim_n_snippets(cfg)
+  f <- S * cfg$snippets$length_min / 1440     # share of the day that is recorded
+  cat("lambda = expected true calls in 24 h at full activity (flat through the day); the recorder only",
+      "hears the share ", round(f, 3), " of the day (", S, " snippets of ", cfg$snippets$length_min,
+      " min). p_fp = false positive probability per snippet;",
+      "p_visit = visitor probability per day in a cell the species does not occupy.\n\n", sep = "")
+  a <- sim_activity(doys, me$onset, me$peak, me$cessation, me$shape_kappa)
+  N <- 1:30
+  lo <- cfg$obs$true_score[1]; hi <- cfg$obs$true_score[2]
+  par(mfrow = c(1, 3), mar = c(4, 4, 3, 1))
+  plot(doys, me$lambda * a, type = "l", lwd = 2, xlab = "day of year",
+       ylab = "expected true calls per day", main = "Calls through the season")
+  lines(doys, me$lambda * a * f, lwd = 2, lty = 2)
+  legend("topright", legend = c("24 h", "in the snippets"), lty = c(1, 2), lwd = 2, bty = "n", cex = 0.8)
+  abline(v = c(cfg$doy_min, cfg$doy_max), lty = 2)
+  plot(doys, 1 - exp(-me$lambda * a * f), type = "l", lwd = 2, ylim = c(0, 1), xlab = "day of year",
+       ylab = "P(at least one true call)", main = "Daily detection chance in snippets, occupied cell")
+  abline(v = c(cfg$doy_min, cfg$doy_max), lty = 2)
+  plot(N, lo + (hi - lo) * N / (N + 1), type = "b", ylim = c(lo, hi),
+       xlab = "true calls in the day", ylab = "expected max score", main = "More calls, higher max score")
+  cat("\n\nP(false positive with score >= 0.8) per snippet: ",
+      round(me$p_fp * (1 - 0.8) / (1 - 0.3), 6), "; per day: ",
+      round(1 - (1 - me$p_fp * (1 - 0.8) / (1 - 0.3))^S, 4), "\n\n", sep = "")
+
+  # ---- a season of daily recordings ----
+  cat("### A season of daily recordings at one occupied and one unoccupied cell\n\n")
+  cat("The occupied cell is drawn from the species-richest quarter of the cells this species occupies",
+      "(set `example_cell` in the header to choose it); the unoccupied cell is random.\n\n")
+  cat("Every day of the season is simulated with `sim_truth_day()`, which also gives the source of the",
+      "highest score. The sampler only sees the score.\n\n")
+  # occupied cell: drawn from the species-richest quarter of the cells this species occupies
+  rich_all <- apply(world$z, c(1, 2), sum)                 # true number of species per cell
+  r_occ <- rich_all[occ]
+  rich_occ <- occ[r_occ >= quantile(r_occ, 0.75), , drop = FALSE]
+  oc <- rich_occ[sample(nrow(rich_occ), 1), ]
+  if (!is.null(params$example_cell)) {
+    rc_ex <- as.numeric(strsplit(params$example_cell, ",")[[1]])
+    if (world$z[rc_ex[1], rc_ex[2], s] == 1) {
+      oc <- c(row = rc_ex[1], col = rc_ex[2])
+    } else {
+      cat("Cell ", params$example_cell, " is not occupied by ", sp_id,
+          "; using a species-rich occupied cell instead.\n\n", sep = "")
+    }
+  }
+  un_all <- which(world$z[, , s] == 0 & ok, arr.ind = TRUE)
+  un <- un_all[sample(nrow(un_all), 1), ]
+  series <- function(i, j) {
+    do.call(rbind, lapply(cfg$doy_min:cfg$doy_max, function(d) {
+      x <- sim_truth_day(i, j, d)[s, ]
+      x$doy <- d
+      x
+    }))
+  }
+  cols <- c(none = "grey70", true = "darkgreen", visitor = "orange", fp = "red")
+  par(mfrow = c(1, 2), mar = c(4, 4, 3, 1))
+  for (cell in list(list(oc, "occupied cell"), list(un, "unoccupied cell"))) {
+    ts <- series(cell[[1]]["row"], cell[[1]]["col"])
+    plot(ts$doy, ts$max_score, pch = 19, col = cols[ts$source], ylim = c(0, 1),
+         xlab = "day of year", ylab = "max classifier score (0 = no call)",
+         main = paste0(sp_id, ", ", cell[[2]], " (", cell[[1]]["row"], ", ", cell[[1]]["col"], ")"))
+    legend("topright", legend = names(cols), col = cols, pch = 19, bty = "n", cex = 0.8)
+  }
+  invisible(list(sp_id = sp_id, oc = oc, un = un))
+}
+```
+
+```{r example1, results="asis", fig.height=5, fig.width=12}
+ex1 <- species_report(id_forest, "Example 1, common forest species")
+```
+
+```{r example2, results="asis", fig.height=5, fig.width=12}
+ex2 <- species_report(id_edge, "Example 2, edge species")
+```
+
+```{r example3, results="asis", fig.height=5, fig.width=12}
+ex3 <- species_report(id_conf, "Example 3, confusable species")
+```
+
+# 5. Demo of the simulator
+
+## One recording
+
+`simulate(i, j, doy)` returns, for one recording day of fixed 1-minute snippets, the highest score
+per species (`max_score`) and the number of snippets with any detection whatever its score
+(`n_snip_det`).
+Here is one recording: the first 10 species and the three examples. By default it is the occupied
+cell of example 1 on day 140; set `one_cell` and `one_doy` in the header to look at another cell.
+
+```{r simulate-one}
+if (is.null(params$one_cell)) {
+  i1 <- unname(ex1$oc["row"]); j1 <- unname(ex1$oc["col"])
+} else {
+  rc1 <- as.numeric(strsplit(params$one_cell, ",")[[1]]); i1 <- rc1[1]; j1 <- rc1[2]
+}
+d1 <- params$one_doy
+out <- simulate(i1, j1, d1)
+knitr::kable(rbind(head(out, 10), out[out$species_id %in% ex_ids, ]), digits = 3,
+             caption = paste0("Recording at cell (", i1, ", ", j1, "), day ", d1))
+```
+
+The same query always returns the same answer:
+
+```{r repro}
+identical(simulate(i1, j1, d1), out)
+```
+
+## The truth behind the same recording
+
+`sim_truth_day()` shows what produced each score. This is never available to the sampler.
+
+```{r truth-day}
+tr <- sim_truth_day(i1, j1, d1)
+knitr::kable(tr[tr$species_id %in% ex_ids, ], digits = 3,
+             caption = "z = true state, n_true = true calls, source = where the highest score came from")
+```
+
+## Several recordings at once
+
+`sim_collect()` takes a table of cells and days. By default there is one cell per day, running
+from a species-poor to a species-rich cell (by true richness; `cell_seed` picks which cell of
+each richness); set `demo_cells` and `demo_doy` in the header to choose your own. The first table
+shows, for each recording, the true number of species in the cell and how many were detected;
+the second shows every detected species plus the three examples.
+
+```{r collect}
+demo_days <- as.numeric(strsplit(params$demo_doy, ",")[[1]])
+if (is.null(params$demo_cells)) {
+  set.seed(params$cell_seed)
+  rich <- apply(world$z, c(1, 2), sum)                     # true richness per cell
+  nd <- length(demo_days)
+  probs <- if (nd > 1) seq(0.1, 0.9, length.out = nd) else 0.5
+  target <- round(quantile(rich[ok], probs, type = 1))     # richness of the poor ... rich cells
+  pick <- t(sapply(target, function(r) {
+    cand <- which(ok & rich == r, arr.ind = TRUE)
+    cand[sample(nrow(cand), 1), ]
+  }))
+  design <- data.frame(i = pick[, 1], j = pick[, 2], doy = demo_days)
+} else {
+  rc <- do.call(rbind, lapply(strsplit(strsplit(params$demo_cells, ";")[[1]], ","), as.numeric))
+  if (nrow(rc) != length(demo_days)) stop("demo_cells and demo_doy need the same number of entries")
+  design <- data.frame(i = rc[, 1], j = rc[, 2], doy = demo_days)
+}
+res <- sim_collect(design)       # stops with a message if a chosen cell is water
+rec <- rep(seq_len(nrow(design)), each = nrow(sp))
+summary_tab <- data.frame(design,
+  true_richness = sapply(seq_len(nrow(design)), function(r) sum(world$z[design$i[r], design$j[r], ])),
+  species_detected = as.vector(tapply(res$max_score > 0, rec, sum)))
+knitr::kable(summary_tab, caption = "Recordings: true species in the cell and species detected")
+knitr::kable(res[res$max_score > 0 | res$species_id %in% ex_ids, ], digits = 3,
+             caption = "Detected species (max_score > 0) and the three examples")
+```
+## 6. True vs HMSC-estimated species-specific beta parameters
+
+We generated simulated data for 100 randomly selected non-water sites and 5 visits per site.\
+Fitted HMSC model to this dataset. models_thin_100_samples_250_chains_4\
+Blue circles are species whose true beta is non-zero; orange triangles are species whose true beta is 0 (not affected by fragmentation). 
+
+```{r beta-compare, fig.width = 14, fig.height = 5.5}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+true_file <- "../outputs/simulated_species.csv"
+est_file  <- "../outputs/hmsc_results/parameter_estimates_Beta_ pa .xlsx"
+
+true_df <- read.csv(true_file, stringsAsFactors = FALSE)
+est_df  <- read_excel(est_file)
+
+# pairing of simulated and HMSC column names
+pairs <- c(beta_forest = "forest_prop_z",
+           beta_edge   = "edge_density_z",
+           beta_buffer = "forest_buf1km_z")
+panel_labels <- c(beta_forest = "Forest cover in 200m cell",
+                  beta_edge   = "Edge density",
+                  beta_buffer = "Forest in 1 km buffer")
+
+stopifnot(all(names(pairs) %in% names(true_df)),
+          all(pairs %in% names(est_df)))
+
+# Species order: if both tables share a species-name column, match by name;
+# otherwise assume the same row order (checked by the row count).
+id_true <- intersect(c("species", "species_id", "Species", "sp"), names(true_df))[1]
+id_est  <- intersect(c("species", "species_id", "Species", "sp"), names(est_df))[1]
+
+if (!is.na(id_true) && !is.na(id_est)) {
+  est_df <- est_df[match(true_df[[id_true]], est_df[[id_est]]), ]
+} else {
+  stopifnot(nrow(true_df) == nrow(est_df))
+  message("No shared species column found; matching by row order.")
+}
+
+plot_df <- bind_rows(lapply(names(pairs), function(b) {
+  data.frame(covariate = panel_labels[[b]],
+             true      = true_df[[b]],
+             est       = est_df[[pairs[[b]]]])
+})) %>%
+  mutate(covariate = factor(covariate, levels = panel_labels),
+         effect    = ifelse(true == 0, "True beta = 0", "True beta \u2260 0"))
+
+# correlation of non-zero species, shown in each panel
+cors <- plot_df %>%
+  filter(true != 0) %>%
+  group_by(covariate) %>%
+  summarise(r = cor(true, est, use = "complete.obs"), .groups = "drop") %>%
+  mutate(label = sprintf("r = %.2f (non-zero)", r))
+
+ggplot(plot_df, aes(true, est, colour = effect, shape = effect)) +
+  geom_hline(yintercept = 0, colour = "grey80") +
+  geom_vline(xintercept = 0, colour = "grey80") +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed", colour = "grey40") +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_text(data = cors, aes(label = label), x = -Inf, y = Inf,
+            hjust = -0.05, vjust = 1.4, inherit.aes = FALSE, size = 5) +
+  scale_colour_manual(values = c("True beta \u2260 0" = "#2c7fb8",
+                                 "True beta = 0"     = "#d95f0e"), name = NULL) +
+  scale_shape_manual(values = c("True beta \u2260 0" = 16,
+                                "True beta = 0"     = 17), name = NULL) +
+  facet_wrap(~ covariate, nrow = 1) +
+  labs(x = "True beta (simulation)", y = "Estimated beta (HMSC posterior mean)") +
+  coord_equal() +
+  theme_bw(base_size = 16) +
+  theme(legend.position = "bottom", strip.background = element_blank())
+```
